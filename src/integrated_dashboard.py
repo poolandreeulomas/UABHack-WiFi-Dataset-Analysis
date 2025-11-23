@@ -469,6 +469,173 @@ from dashboard.simulator_viz import (
     simulate_multiple_ap_additions,
 )
 
+from dashboard.voronoi_selection import (
+    CandidateScore,
+    select_best_candidate,
+)
+
+
+def _build_simulation_components_from_params(
+    params: Dict[str, Any],
+) -> tuple[SimulationConfig, CompositeScorer]:
+    """Construct simulation config and scorer objects from sidebar parameters."""
+    w_worst = float(params.get('w_worst', 0.30))
+    w_avg = float(params.get('w_avg', 0.30))
+    w_cov = float(params.get('w_cov', 0.20))
+    w_neigh = float(params.get('w_neigh', 0.20))
+    interference_radius = float(params.get('interference_radius', 50.0))
+    cca_increase = float(params.get('cca_increase', 0.15))
+    threshold = float(params.get('threshold', 0.6))
+    snapshots = int(params.get('snapshots', 5))
+
+    config = SimulationConfig(
+        interference_radius_m=interference_radius,
+        cca_increase_factor=cca_increase,
+        indoor_only=True,
+        conflictivity_threshold_placement=threshold,
+        snapshots_per_profile=snapshots,
+        target_stress_profile=None,
+        weight_worst_ap=w_worst,
+        weight_average=w_avg,
+        weight_coverage=w_cov,
+        weight_neighborhood=w_neigh,
+    )
+
+    scorer = CompositeScorer(
+        weight_worst_ap=w_worst,
+        weight_average=w_avg,
+        weight_coverage=w_cov,
+        weight_neighborhood=w_neigh,
+        neighborhood_mode=NeighborhoodOptimizationMode.BALANCED,
+        interference_radius_m=interference_radius,
+    )
+    return config, scorer
+
+
+def _ensure_default_voronoi_candidate_preview(
+    *,
+    candidates: pd.DataFrame,
+    geo_df: pd.DataFrame,
+    params: Dict[str, Any],
+    selected_path: Path,
+    selected_dt: datetime,
+) -> None:
+    """Auto-evaluate Voronoi candidates for the active snapshot and preselect the best one."""
+    if not simulator_available:
+        return
+    if candidates.empty:
+        st.session_state.pop('vor_candidate_scores', None)
+        return
+    if 'voronoi_signature' not in st.session_state:
+        return
+
+    signature = (
+        st.session_state.get('voronoi_signature'),
+        str(selected_path),
+        selected_dt.isoformat(),
+        float(params.get('threshold', 0.6)),
+        float(params.get('interference_radius', 50.0)),
+        float(params.get('cca_increase', 0.15)),
+        float(params.get('w_worst', 0.30)),
+        float(params.get('w_avg', 0.30)),
+        float(params.get('w_cov', 0.20)),
+        float(params.get('w_neigh', 0.20)),
+        len(candidates),
+    )
+
+    if st.session_state.get('vor_auto_signature') == signature:
+        return
+
+    base_df = read_ap_snapshot(selected_path, band_mode='worst')
+    base_df = base_df.merge(geo_df, on='name', how='inner')
+    base_df = base_df[base_df['group_code'] != 'SAB'].copy()
+    if base_df.empty:
+        return
+
+    config, scorer = _build_simulation_components_from_params(params)
+    total_candidates = len(candidates)
+    if total_candidates == 0:
+        return
+
+    candidates = candidates.reset_index(drop=True)
+    aggregated_rows: list[Dict[str, Any]] = []
+    candidate_scores: list[CandidateScore] = []
+    best_preview_df: Optional[pd.DataFrame] = None
+    best_preview_metrics: Optional[Dict[str, Any]] = None
+
+    with st.spinner("Auto-evaluating Voronoi candidates on current snapshot..."):
+        progress = st.progress(0.0)
+        for iter_idx, cand_row in enumerate(candidates.itertuples(index=True), start=1):
+            lat = float(cand_row.lat)
+            lon = float(cand_row.lon)
+            try:
+                df_after, _, metrics = simulate_ap_addition(
+                    base_df,
+                    lat,
+                    lon,
+                    config,
+                    scorer,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging inside Streamlit
+                st.warning(f"Auto-evaluation failed for candidate AP-VOR-{cand_row.Index + 1}: {exc}")
+                progress.progress(iter_idx / total_candidates)
+                continue
+
+            metrics = dict(metrics)
+            metrics.setdefault('stress_profile', 'snapshot')
+            metrics.setdefault('timestamp', selected_dt)
+
+            base_conf_attr = getattr(cand_row, 'avg_conflictivity', None)
+            if base_conf_attr is None:
+                base_conf_attr = getattr(cand_row, 'conflictivity', 0.0)
+            base_conf = float(base_conf_attr or 0.0)
+            aggregated = aggregate_scenario_results(
+                lat,
+                lon,
+                max(base_conf, 0.0),
+                [metrics],
+            )
+            aggregated['candidate_index'] = int(cand_row.Index)
+            aggregated_rows.append(aggregated)
+            score = CandidateScore.from_metrics(int(cand_row.Index), aggregated)
+            candidate_scores.append(score)
+
+            current_best = select_best_candidate(candidate_scores)
+            if current_best is not None and current_best.index == score.index:
+                best_preview_df = df_after
+                best_preview_metrics = metrics
+
+            progress.progress(iter_idx / total_candidates)
+        progress.empty()
+
+    if not aggregated_rows:
+        return
+
+    results_df = pd.DataFrame(aggregated_rows)
+    results_df = results_df.sort_values(
+        ['final_score', 'avg_reduction_raw_mean', 'worst_ap_improvement_raw_mean', 'new_ap_client_count_mean', 'score_std'],
+        ascending=[False, False, False, False, True],
+    ).reset_index(drop=True)
+    results_df['rank'] = np.arange(1, len(results_df) + 1)
+
+    best_score = select_best_candidate(candidate_scores)
+    if best_score is None or best_preview_df is None or best_preview_metrics is None:
+        return
+
+    st.session_state['vor_candidate_scores'] = results_df
+    st.session_state['vor_auto_signature'] = signature
+    st.session_state['vor_auto_best_idx'] = best_score.index
+    best_row = results_df.loc[results_df['candidate_index'] == best_score.index].iloc[0].to_dict()
+    st.session_state['vor_auto_best_metrics'] = best_row
+    st.session_state['vor_selected_rows'] = {best_score.index}
+    st.session_state['map_override_df'] = best_preview_df
+    st.session_state['new_node_markers'] = [{
+        'lat': float(best_row.get('lat', candidates.loc[best_score.index, 'lat'])),
+        'lon': float(best_row.get('lon', candidates.loc[best_score.index, 'lon'])),
+        'label': f"AP-VOR-{best_score.index + 1}",
+    }]
+    st.session_state['map_preview_metrics'] = best_preview_metrics
+
 
 # Note: _inverted_weighted_voronoi_edges and _top_conflictive_voronoi_vertices
 # are now imported from dashboard.voronoi_viz module (see imports above)
@@ -898,7 +1065,7 @@ with st.sidebar:
                             tile_radius_clearance_m=sim_inner_clearance_m,
                             merge_radius_m=sim_merge_radius,
                             max_vertices_per_scenario=60,
-                        )
+                        ).reset_index(drop=True)
                         st.session_state.voronoi_candidates = vor_df
                         st.session_state.voronoi_signature = voronoi_signature
                         if vor_df.empty:
@@ -1213,6 +1380,11 @@ elif viz_mode == "Voronoi":
     sab_df = tmp[tmp["group_code"] == "SAB"].copy()
     uab_df = tmp[tmp["group_code"] != "SAB"].copy()
 
+    vor_df: Optional[pd.DataFrame] = None
+    stored_vor = st.session_state.get('voronoi_candidates')
+    if isinstance(stored_vor, pd.DataFrame) and not stored_vor.empty:
+        vor_df = stored_vor
+
     fig = go.Figure()
 
     # UAB interpolation
@@ -1425,6 +1597,11 @@ else:  # Simulator
     sab_df = tmp[tmp["group_code"] == "SAB"].copy()
     uab_df = tmp[tmp["group_code"] != "SAB"].copy()
 
+    vor_df: Optional[pd.DataFrame] = None
+    stored_vor = st.session_state.get('voronoi_candidates')
+    if isinstance(stored_vor, pd.DataFrame) and not stored_vor.empty:
+        vor_df = stored_vor
+
     fig = go.Figure()
 
     # UAB interpolation
@@ -1449,8 +1626,7 @@ else:  # Simulator
         ))
 
     # Overlay Voronoi candidate markers if discovered
-    if 'voronoi_candidates' in st.session_state and not st.session_state.voronoi_candidates.empty:
-        vor_df = st.session_state.voronoi_candidates
+    if vor_df is not None:
         fig.add_trace(go.Scattermap(
             lat=vor_df['lat'],
             lon=vor_df['lon'],
@@ -1462,6 +1638,16 @@ else:  # Simulator
             hovertemplate='<b>%{text}</b><br>Avg Conflictivity: %{customdata[0]:.3f}<br>Freq: %{customdata[1]:.0f}<extra></extra>',
             customdata=np.column_stack([vor_df['avg_conflictivity'], vor_df['freq']])
         ))
+
+    auto_params = st.session_state.get('sim_params')
+    if vor_df is not None and auto_params:
+        _ensure_default_voronoi_candidate_preview(
+            candidates=vor_df,
+            geo_df=geo_df,
+            params=auto_params,
+            selected_path=selected_path,
+            selected_dt=selected_dt,
+        )
     
     # Run simulation if enabled
     if run_simulation and st.session_state.get('run_sim', False) and simulator_available:
@@ -1572,7 +1758,7 @@ else:  # Simulator
                             tile_radius_clearance_m=5.0,
                             merge_radius_m=sim_merge_radius,
                             max_vertices_per_scenario=60,
-                        )
+                        ).reset_index(drop=True)
                     else:
                         first_path = all_scenarios[0][1]
                         df_first = read_ap_snapshot(first_path, band_mode='worst')
@@ -1933,23 +2119,51 @@ else:  # Simulator
         st.plotly_chart(fig_sim, width="stretch")
     
     # Display Voronoi Candidates table if detected
-    if 'voronoi_candidates' in st.session_state and not st.session_state.voronoi_candidates.empty:
-        vor_df = st.session_state.voronoi_candidates
+    if vor_df is not None:
         st.divider()
         st.subheader("🧬 Voronoi Candidates")
-        st.caption("Click Select checkbox and click Simulate selected to evaluate adding APs at those vertices across scenarios.")
-        
+        st.caption("Select any combination of candidates, then press Simulate selected to apply them on the map.")
+
+        auto_best = st.session_state.get('vor_auto_best_metrics')
+        if auto_best:
+            best_label = f"AP-VOR-{int(auto_best.get('candidate_index', 0)) + 1}"
+            st.info(
+                f"Automatically previewing {best_label} (score {float(auto_best.get('final_score', 0.0)):.3f}, "
+                f"avg reduction {float(auto_best.get('avg_reduction_raw_mean', 0.0)):.3f}). "
+                "Use the checkboxes below to choose other candidates and click Simulate selected to compare them."
+            )
+
+        params = st.session_state.get('sim_params', {})
+        prev_sel = set(st.session_state.get('vor_selected_rows', set()))
+
+        action_cols = st.columns([1, 1, 1, 4])
+        with action_cols[0]:
+            simulate_clicked = st.button("Simulate selected", use_container_width=True)
+        with action_cols[1]:
+            if st.button("Select all", use_container_width=True):
+                prev_sel = set(range(len(vor_df)))
+                st.session_state['vor_selected_rows'] = prev_sel
+                st.session_state.pop('batch_vor_results', None)
+        with action_cols[2]:
+            if st.button("Clear all", use_container_width=True):
+                prev_sel = set()
+                st.session_state['vor_selected_rows'] = prev_sel
+                st.session_state.pop('batch_vor_results', None)
+        results_column = action_cols[3]
+
         # Selectable editor with checkbox column
         display_vor = vor_df[['lat','lon','avg_conflictivity','max_conflictivity','freq','avg_min_dist_m']].copy()
         display_vor.columns = ['Latitude','Longitude','Avg Conflict','Max Conflict','Freq','Avg Dist (m)']
         display_vor['Idx'] = np.arange(len(display_vor))
-        prev_sel = st.session_state.get('vor_selected_rows', set())
         display_vor['Select'] = display_vor['Idx'].apply(lambda i: i in prev_sel)
-        
+
         edited = st.data_editor(
             display_vor,
             width="stretch",
             hide_index=True,
+            column_config={
+                'Select': st.column_config.CheckboxColumn("Select", help="Mark candidates to include in the next simulation"),
+            },
             disabled={
                 'Latitude': True,
                 'Longitude': True,
@@ -1964,108 +2178,69 @@ else:  # Simulator
         )
         current_sel = set(edited.loc[edited['Select'] == True, 'Idx'].astype(int).tolist())
         st.session_state['vor_selected_rows'] = current_sel
-        
-        col_run, col_results = st.columns([1,4])
-        with col_run:
-            if st.button("Simulate selected"):
-                if not current_sel:
-                    st.warning("Select at least one candidate to simulate.")
-                else:
-                    params = st.session_state.get('sim_params', {})
-                    w_worst = params.get('w_worst', 0.30)
-                    w_avg = params.get('w_avg', 0.30)
-                    w_cov = params.get('w_cov', 0.20)
-                    w_neigh = params.get('w_neigh', 0.20)
-                    interference_radius = params.get('interference_radius', 50)
-                    cca_increase = params.get('cca_increase', 0.15)
-                    
-                    cfg = SimulationConfig(
-                        interference_radius_m=interference_radius,
-                        cca_increase_factor=cca_increase,
-                        indoor_only=True,
-                        conflictivity_threshold_placement=params.get('threshold', 0.6),
-                        snapshots_per_profile=params.get('snapshots', 5),
-                        target_stress_profile=None,
-                        weight_worst_ap=w_worst,
-                        weight_average=w_avg,
-                        weight_coverage=w_cov,
-                        weight_neighborhood=w_neigh,
-                    )
-                    scorer = CompositeScorer(
-                        weight_worst_ap=w_worst,
-                        weight_average=w_avg,
-                        weight_coverage=w_cov,
-                        weight_neighborhood=w_neigh,
-                        neighborhood_mode=NeighborhoodOptimizationMode.BALANCED,
-                        interference_radius_m=interference_radius,
-                    )
-                    
-                    batch_results = []
-                    combined_points = []
-                    progress = st.progress(0.0)
-                    
-                    for b_i, idx in enumerate(sorted(current_sel)):
-                        row = vor_df.iloc[idx]
-                        single_results = []
-                        combined_points.append({'lat': float(row['lat']), 'lon': float(row['lon']), 'label': f"AP-VOR-{idx+1}"})
-                        
-                        for (profile, snap_path, snap_dt) in st.session_state.get('voronoi_scenarios', []):
-                            df_snap = read_ap_snapshot(snap_path, band_mode='worst').merge(geo_df, on='name', how='inner')
-                            df_snap = df_snap[df_snap['group_code'] != 'SAB'].copy()
-                            if df_snap.empty:
-                                continue
-                            _, new_ap_stats, metrics = simulate_ap_addition(
-                                df_snap,
-                                float(row['lat']),
-                                float(row['lon']),
-                                cfg,
-                                scorer,
-                            )
-                            metrics['stress_profile'] = profile.value
-                            metrics['timestamp'] = snap_dt
-                            single_results.append(metrics)
-                        
-                        if single_results:
-                            agg = aggregate_scenario_results(float(row['lat']), float(row['lon']), float(row.get('avg_conflictivity', 0.0)), single_results)
-                            agg['label'] = f"AP-VOR-{idx+1}"
-                            batch_results.append(agg)
-                        
-                        progress.progress((b_i+1)/max(1,len(current_sel)))
-                    
-                    progress.empty()
-                    
-                    if batch_results:
-                        res_df = pd.DataFrame(batch_results)
-                        res_df = res_df.sort_values('final_score', ascending=False)
-                        st.session_state['batch_vor_results'] = res_df
-                        
-                        # Update main map with combined simulation of selected APs on latest snapshot
-                        try:
-                            base_latest = read_ap_snapshot(selected_path, band_mode='worst').merge(geo_df, on='name', how='inner')
-                            base_latest = base_latest[base_latest['group_code'] != 'SAB'].copy()
-                            if not base_latest.empty:
-                                cfg_multi = SimulationConfig(
-                                    interference_radius_m=interference_radius,
-                                    cca_increase_factor=cca_increase,
-                                    indoor_only=True,
-                                    conflictivity_threshold_placement=params.get('threshold', 0.6),
-                                    snapshots_per_profile=params.get('snapshots', 5),
-                                    target_stress_profile=None,
-                                    weight_worst_ap=w_worst,
-                                    weight_average=w_avg,
-                                    weight_coverage=w_cov,
-                                    weight_neighborhood=w_neigh,
-                                )
-                                df_after_multi = simulate_multiple_ap_additions(base_latest, combined_points, cfg_multi)
-                                st.session_state['map_override_df'] = df_after_multi
-                                st.session_state['new_node_markers'] = combined_points
-                                st.success("Simulated Map rendered below with sky blue NEW AP markers.")
-                                # Trigger a rerun so the map section can render the Simulated Map
-                                st.rerun()
-                        except Exception as e:
-                            st.warning(f"Combined map update failed: {e}")
-        
-        with col_results:
+
+        if simulate_clicked:
+            if not current_sel:
+                st.info("Select at least one candidate before simulating.")
+            else:
+                cfg, scorer = _build_simulation_components_from_params(params)
+                batch_results: list[dict[str, Any]] = []
+                combined_points: list[dict[str, float | str]] = []
+                progress = st.progress(0.0)
+
+                selections = sorted(current_sel)
+                scenario_pool = st.session_state.get('voronoi_scenarios', [])
+                for b_i, idx in enumerate(selections):
+                    row = vor_df.iloc[idx]
+                    single_results: list[dict[str, Any]] = []
+                    combined_points.append({'lat': float(row['lat']), 'lon': float(row['lon']), 'label': f"AP-VOR-{idx+1}"})
+
+                    for (profile, snap_path, snap_dt) in scenario_pool:
+                        df_snap = read_ap_snapshot(snap_path, band_mode='worst').merge(geo_df, on='name', how='inner')
+                        df_snap = df_snap[df_snap['group_code'] != 'SAB'].copy()
+                        if df_snap.empty:
+                            continue
+                        _, _, metrics = simulate_ap_addition(
+                            df_snap,
+                            float(row['lat']),
+                            float(row['lon']),
+                            cfg,
+                            scorer,
+                        )
+                        metrics['stress_profile'] = profile.value
+                        metrics['timestamp'] = snap_dt
+                        single_results.append(metrics)
+
+                    if single_results:
+                        agg = aggregate_scenario_results(
+                            float(row['lat']),
+                            float(row['lon']),
+                            float(row.get('avg_conflictivity', 0.0)),
+                            single_results,
+                        )
+                        agg['label'] = f"AP-VOR-{idx+1}"
+                        batch_results.append(agg)
+
+                    progress.progress((b_i + 1) / max(1, len(selections)))
+
+                progress.empty()
+
+                if batch_results:
+                    res_df = pd.DataFrame(batch_results).sort_values('final_score', ascending=False)
+                    st.session_state['batch_vor_results'] = res_df
+
+                    try:
+                        base_latest = read_ap_snapshot(selected_path, band_mode='worst').merge(geo_df, on='name', how='inner')
+                        base_latest = base_latest[base_latest['group_code'] != 'SAB'].copy()
+                        if not base_latest.empty:
+                            df_after_multi = simulate_multiple_ap_additions(base_latest, combined_points, cfg)
+                            st.session_state['map_override_df'] = df_after_multi
+                            st.session_state['new_node_markers'] = combined_points
+                            st.success("Simulated map updated with the selected Voronoi candidates.")
+                    except Exception as exc:  # pragma: no cover - defensive UI feedback
+                        st.warning(f"Combined map update failed: {exc}")
+
+        with results_column:
             if 'batch_vor_results' in st.session_state:
                 res_df = st.session_state['batch_vor_results']
                 show_cols = [c for c in ['label','lat','lon','final_score','score_std','avg_reduction_raw_mean','worst_ap_improvement_raw_mean','new_ap_client_count_mean','n_scenarios'] if c in res_df.columns]
@@ -2082,7 +2257,27 @@ else:  # Simulator
                         'n_scenarios': '{:.0f}',
                     }).background_gradient(subset=['final_score'], cmap='RdYlGn'),
                     width="stretch",
-                    hide_index=True
+                    hide_index=True,
                 )
-        
-        st.caption(f"💡 **{len(vor_df)} candidates detected**. Freq = how many scenarios this vertex appeared in. Higher frequency = more stable location.")
+            elif 'vor_candidate_scores' in st.session_state:
+                auto_df = st.session_state['vor_candidate_scores']
+                if isinstance(auto_df, pd.DataFrame) and not auto_df.empty:
+                    auto_display = auto_df[['rank','candidate_index','final_score','avg_reduction_raw_mean','worst_ap_improvement_raw_mean','new_ap_client_count_mean']].copy()
+                    auto_display['Candidate'] = auto_display['candidate_index'].apply(lambda idx: f"AP-VOR-{int(idx)+1}")
+                    auto_display = auto_display[['rank','Candidate','final_score','avg_reduction_raw_mean','worst_ap_improvement_raw_mean','new_ap_client_count_mean']]
+                    auto_display.columns = ['Rank','Candidate','Score','Avg Reduction','Worst AP Improv','New AP Clients']
+                    st.subheader("📌 Snapshot auto-evaluation")
+                    st.dataframe(
+                        auto_display.style.format({
+                            'Score': '{:.3f}',
+                            'Avg Reduction': '{:.3f}',
+                            'Worst AP Improv': '{:.3f}',
+                            'New AP Clients': '{:.1f}',
+                        }).background_gradient(subset=['Score'], cmap='RdYlGn'),
+                        width="stretch",
+                        hide_index=True,
+                    )
+
+        st.caption(
+            f"💡 **{len(vor_df)} Voronoi candidates detected.** Toggle selections freely — maps update only when you run a simulation."
+        )
