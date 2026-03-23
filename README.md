@@ -6,6 +6,8 @@
 
 Navigate the treacherous waters of campus WiFi and chart a course to optimal network performance! This integrated dashboard helps identify, analyze, and solve WiFi conflicts across the UAB campus using AI-powered analysis and advanced network simulation.
 
+![Demo](UAB_Wifi.gif)
+
 ## ⚓ The Arsenal: Three Visualization Modes
 
 Our integrated dashboard (`deliverable/integrated_dashboard.py`) provides three powerful tools to conquer WiFi conflicts:
